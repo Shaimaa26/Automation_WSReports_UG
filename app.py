@@ -1,4 +1,3 @@
-
 import io
 import re
 import json
@@ -16,6 +15,28 @@ st.set_page_config(
     layout="wide",
 )
 
+EXCEL_MAX_ROWS = 1_048_000  # Excel hard limit is 1,048,576 rows per sheet
+XLSX_MIME = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+@st.cache_resource(show_spinner="Installing browser (first run only)...")
+def ensure_browser():
+    """Download Chromium for Playwright once per server start."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-800:] or result.stdout[-800:])
+    return True
+
+
 st.title("📡 Worldsensing Automation Portal")
 st.caption("Sensor Management | CSV Collection | Excel Consolidation")
 
@@ -28,13 +49,6 @@ def safe_name(value):
     return value[:100] or "unnamed_sensor"
 
 
-def sensor_id_from_url(url):
-    match = re.search(r"/reading/(\d+)/", url)
-    if match:
-        return match.group(1)
-    return ""
-
-
 def normalize_sensor_name(name, sensor_id=""):
     name = str(name).strip()
     if not name or name.lower().startswith("http"):
@@ -42,60 +56,146 @@ def normalize_sensor_name(name, sensor_id=""):
     return name
 
 
-def make_excel(sensor_name, frames):
-    """Create one workbook for one sensor."""
+# Filename example:
+# 177340-LSG7ACLBXLHVIB-1-readings-VIBPPV-current.csv
+#   177340          -> Serial number (node ID)
+#   LSG7ACLBXLHVIB  -> Model code
+#   1               -> Channel
+#   VIBPPV          -> Reading type
+#   current         -> Period
+FILENAME_PATTERN = re.compile(
+    r"^(?P<serial>\d+)-(?P<model>[A-Za-z0-9]+)-(?P<channel>\d+)"
+    r"-readings-(?P<reading_type>[A-Za-z0-9]+)-(?P<period>[A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_report_filename(filename, fallback_serial=""):
+    """Extract serial / model / channel / reading type from the CSV name."""
+    stem = Path(str(filename)).name
+    m = FILENAME_PATTERN.match(stem)
+    if m:
+        return {
+            "Serial_Number": m.group("serial"),
+            "Model": m.group("model").upper(),
+            "Channel": m.group("channel"),
+            "Reading_Type": m.group("reading_type"),
+            "Period": m.group("period"),
+        }
+    return {
+        "Serial_Number": fallback_serial,
+        "Model": "",
+        "Channel": "",
+        "Reading_Type": "",
+        "Period": "",
+    }
+
+
+def enrich_frame(df, sensor_name, sensor_id, filename):
+    """Insert sensor identification columns at the start of a dataframe."""
+    meta = parse_report_filename(filename, fallback_serial=sensor_id)
+    current = df.copy()
+
+    columns = {
+        "Sensor_Name": sensor_name,
+        "Sensor_ID": sensor_id,
+        "Serial_Number": meta["Serial_Number"],
+        "Model": meta["Model"],
+        "Channel": meta["Channel"],
+        "Reading_Type": meta["Reading_Type"],
+        "Source_File": filename,
+    }
+
+    # Drop same-named columns if the CSV already has them.
+    for col in columns:
+        if col in current.columns:
+            current = current.drop(columns=[col])
+
+    for pos, (col, val) in enumerate(columns.items()):
+        current.insert(pos, col, val)
+
+    return current
+
+
+def sort_by_time(data):
+    if "Measurement-datetime" in data.columns:
+        data = data.copy()
+        data["_sort_time"] = pd.to_datetime(
+            data["Measurement-datetime"], errors="coerce", utc=True
+        )
+        data = data.sort_values(
+            ["Sensor_Name", "_sort_time"], na_position="last"
+        ).drop(columns=["_sort_time"])
+    return data
+
+
+def build_summary(data):
+    id_cols = [
+        c for c in
+        ["Sensor_Name", "Serial_Number", "Model", "Channel", "Reading_Type"]
+        if c in data.columns
+    ]
+    return (
+        data.groupby(id_cols, dropna=False)
+        .size()
+        .reset_index(name="Rows")
+    )
+
+
+def make_excel(sheets):
+    """Generic writer: sheets = {sheet_name: dataframe}."""
     output = io.BytesIO()
+    used = set()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        combined = []
-
-        for report_name, df in frames:
-            if df.empty:
-                continue
-
-            current = df.copy()
-            current.insert(0, "Source_Report", report_name)
-            combined.append(current)
-
-        if combined:
-            data = pd.concat(combined, ignore_index=True, sort=False)
-
-            if "Measurement-datetime" in data.columns:
-                data["_sort_time"] = pd.to_datetime(
-                    data["Measurement-datetime"],
-                    errors="coerce",
-                    utc=True,
-                )
-                data = data.sort_values("_sort_time", na_position="last")
-                data = data.drop(columns=["_sort_time"])
-
-            data.to_excel(
-                writer,
-                sheet_name="All_Readings",
-                index=False,
-            )
-
-        for i, (report_name, df) in enumerate(frames[:10], start=1):
-            sheet = safe_name(Path(report_name).stem)[:31]
-            if not sheet:
-                sheet = f"Report_{i}"
-
-            # Avoid duplicate worksheet names.
-            base = sheet
-            suffix = 1
-            while sheet in writer.sheets:
-                sheet = f"{base[:26]}_{suffix}"
-                suffix += 1
-
+        for name, df in sheets.items():
+            sheet = safe_name(name)[:31] or "Sheet"
+            base, n = sheet, 1
+            while sheet in used:
+                sheet = f"{base[:28]}_{n}"
+                n += 1
+            used.add(sheet)
             df.to_excel(writer, sheet_name=sheet, index=False)
 
-        if not frames:
+        if not sheets:
             pd.DataFrame({"Info": ["No readable reports found."]}).to_excel(
                 writer, sheet_name="Info", index=False
             )
 
-    output.seek(0)
     return output.getvalue()
+
+
+def make_sensor_workbook(frames):
+    """One workbook for one sensor (frames are already enriched)."""
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return make_excel({})
+    data = sort_by_time(pd.concat(frames, ignore_index=True, sort=False))
+    return make_excel({"All_Readings": data})
+
+
+def make_master_outputs(all_frames):
+    """
+    Build the single consolidated file for ALL sensors.
+    Returns (xlsx_bytes_or_None, csv_bytes, combined_dataframe).
+    """
+    frames = [f for f in all_frames if not f.empty]
+    if not frames:
+        return None, b"", pd.DataFrame()
+
+    data = sort_by_time(pd.concat(frames, ignore_index=True, sort=False))
+    csv_bytes = data.to_csv(index=False).encode("utf-8-sig")
+
+    xlsx_bytes = None
+    if len(data) <= EXCEL_MAX_ROWS:
+        xlsx_bytes = make_excel(
+            {
+                "All_Sensors": data,
+                "Sensor_Summary": build_summary(data),
+            }
+        )
+
+    return xlsx_bytes, csv_bytes, data
 
 
 # --------------------------------------------------
@@ -187,16 +287,14 @@ tab_inventory, tab_collection, tab_direct = st.tabs(
 # --------------------------------------------------
 
 def create_authenticated_page(playwright):
+    ensure_browser()
+
     browser = playwright.chromium.launch(headless=True)
     context = browser.new_context(accept_downloads=True)
     page = context.new_page()
 
     if login_url:
-        page.goto(
-            login_url,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
 
         if username and password:
             if page.locator(username_selector).count():
@@ -207,18 +305,11 @@ def create_authenticated_page(playwright):
 
             if page.locator(submit_selector).count():
                 page.locator(submit_selector).first.click()
-                page.wait_for_load_state(
-                    "domcontentloaded",
-                    timeout=30000,
-                )
+                page.wait_for_load_state("domcontentloaded", timeout=30000)
 
             page.wait_for_timeout(delay * 1000)
 
-    page.goto(
-        sensors_url,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+    page.goto(sensors_url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(delay * 1000)
 
     return browser, context, page
@@ -272,6 +363,7 @@ def get_sensors(page):
 def get_report_links(page):
     elements = page.locator(report_selector)
     results = []
+    seen = set()
 
     for i in range(elements.count()):
         el = elements.nth(i)
@@ -280,8 +372,12 @@ def get_report_links(page):
         if href:
             full_url = urljoin(page.url, href)
 
+            if full_url in seen:
+                continue
+
             # Restrict downloads to CSV endpoints.
             if ".csv" in full_url.lower() or "reading/" in full_url.lower():
+                seen.add(full_url)
                 label = el.get_attribute("download") or ""
                 results.append({
                     "url": full_url,
@@ -292,15 +388,10 @@ def get_report_links(page):
 
 
 def download_csv_with_context(context, url):
-    response = context.request.get(
-        url,
-        timeout=60000,
-    )
+    response = context.request.get(url, timeout=60000)
 
     if not response.ok:
-        raise RuntimeError(
-            f"HTTP {response.status} while fetching the report"
-        )
+        raise RuntimeError(f"HTTP {response.status} while fetching the report")
 
     content = response.body()
 
@@ -379,11 +470,7 @@ with tab_inventory:
     if inventory:
         inventory_df = pd.DataFrame(inventory)
 
-        st.dataframe(
-            inventory_df,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(inventory_df, use_container_width=True, hide_index=True)
 
         st.download_button(
             "Export inventory CSV",
@@ -400,8 +487,9 @@ with tab_collection:
     st.subheader("Collect sensor reports")
 
     st.write(
-        "The app opens each discovered sensor page, identifies its CSV report "
-        "links, downloads the readings, and creates one Excel workbook per sensor."
+        "The app opens each sensor page, downloads every readings CSV, adds "
+        "Sensor / Serial / Model columns, and merges everything into ONE "
+        "master file (plus per-sensor workbooks in the ZIP)."
     )
 
     if st.button("Start report collection", type="primary"):
@@ -425,6 +513,7 @@ with tab_collection:
                 downloaded = []
                 errors = []
                 workbooks = {}
+                all_frames = []  # enriched frames from ALL sensors
 
                 progress = st.progress(0)
                 status = st.empty()
@@ -433,9 +522,7 @@ with tab_collection:
                     name = sensor["Sensor_Name"]
                     sensor_id = sensor["Sensor_ID"]
 
-                    status.write(
-                        f"Sensor {i + 1}/{len(sensors)}: {name}"
-                    )
+                    status.write(f"Sensor {i + 1}/{len(sensors)}: {name}")
 
                     try:
                         page.goto(
@@ -446,13 +533,12 @@ with tab_collection:
                         page.wait_for_timeout(delay * 1000)
 
                         report_links = get_report_links(page)
-                        frames = []
+                        sensor_frames = []
 
                         for report in report_links:
                             try:
                                 content = download_csv_with_context(
-                                    context,
-                                    report["url"],
+                                    context, report["url"]
                                 )
 
                                 filename = (
@@ -461,26 +547,39 @@ with tab_collection:
                                 )
 
                                 df = parse_csv(content)
+                                enriched = enrich_frame(
+                                    df, name, sensor_id, filename
+                                )
 
-                                # Keep the source report URL for traceability.
                                 downloaded.append({
                                     "sensor": name,
                                     "sensor_id": sensor_id,
+                                    "serial": (
+                                        enriched["Serial_Number"].iloc[0]
+                                        if len(enriched) else ""
+                                    ),
+                                    "model": (
+                                        enriched["Model"].iloc[0]
+                                        if len(enriched) else ""
+                                    ),
                                     "filename": filename,
                                     "content": content,
                                     "url": report["url"],
                                     "rows": len(df),
                                 })
 
-                                frames.append((filename, df))
+                                sensor_frames.append(enriched)
+                                all_frames.append(enriched)
 
                             except Exception as exc:
                                 errors.append(
                                     f"{name} / {report['url']}: {exc}"
                                 )
 
-                        if frames:
-                            workbooks[name] = make_excel(name, frames)
+                        if sensor_frames:
+                            workbooks[name] = make_sensor_workbook(
+                                sensor_frames
+                            )
                         else:
                             errors.append(
                                 f"{name}: no usable readings CSV was downloaded."
@@ -507,37 +606,68 @@ with tab_collection:
                     {
                         "Sensor": item["sensor"],
                         "Sensor ID": item["sensor_id"],
+                        "Serial": item["serial"],
+                        "Model": item["model"],
                         "Report": item["filename"],
                         "Rows": item["rows"],
                     }
                     for item in downloaded
                 ])
 
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+
+                # ---------- Master consolidated file ----------
+                master_xlsx, master_csv, master_df = make_master_outputs(
+                    all_frames
+                )
+
+                st.subheader("Consolidated master file")
+                st.caption(
+                    f"{len(master_df):,} rows from {len(sensors)} sensor(s)."
+                )
                 st.dataframe(
-                    summary,
+                    master_df.head(50),
                     use_container_width=True,
                     hide_index=True,
                 )
 
-                # Build one ZIP containing original CSVs, workbooks,
-                # inventory, summary and a manifest.
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    if master_xlsx:
+                        st.download_button(
+                            "Download MASTER Excel (all sensors)",
+                            data=master_xlsx,
+                            file_name="worldsensing_master.xlsx",
+                            mime=XLSX_MIME,
+                            type="primary",
+                        )
+                    else:
+                        st.warning(
+                            "Too many rows for one Excel sheet - use the CSV."
+                        )
+
+                with col2:
+                    st.download_button(
+                        "Download MASTER CSV (all sensors)",
+                        data=master_csv,
+                        file_name="worldsensing_master.csv",
+                        mime="text/csv",
+                    )
+
+                # ---------- ZIP with everything ----------
                 bundle = io.BytesIO()
 
                 with zipfile.ZipFile(
-                    bundle,
-                    "w",
-                    zipfile.ZIP_DEFLATED,
+                    bundle, "w", zipfile.ZIP_DEFLATED
                 ) as archive:
 
                     for item in downloaded:
-                        original_path = (
+                        archive.writestr(
                             "original_reports/"
                             + safe_name(item["sensor"])
                             + "__"
-                            + safe_name(item["filename"])
-                        )
-                        archive.writestr(
-                            original_path,
+                            + safe_name(item["filename"]),
                             item["content"],
                         )
 
@@ -547,22 +677,27 @@ with tab_collection:
                             workbook,
                         )
 
+                    if master_xlsx:
+                        archive.writestr(
+                            "worldsensing_master.xlsx", master_xlsx
+                        )
+                    archive.writestr("worldsensing_master.csv", master_csv)
+
                     archive.writestr(
                         "sensor_inventory.csv",
                         pd.DataFrame(sensors).to_csv(index=False),
                     )
-
                     archive.writestr(
                         "collection_summary.csv",
                         summary.to_csv(index=False),
                     )
-
                     archive.writestr(
                         "manifest.json",
                         json.dumps(
                             {
                                 "reports_downloaded": len(downloaded),
                                 "sensors_scanned": len(sensors),
+                                "master_rows": len(master_df),
                                 "issues": errors,
                                 "created_at_unix": int(time.time()),
                             },
@@ -571,11 +706,10 @@ with tab_collection:
                     )
 
                 st.download_button(
-                    "Download all reports and Excel workbooks",
+                    "Download everything (ZIP)",
                     data=bundle.getvalue(),
                     file_name="worldsensing_collection.zip",
                     mime="application/zip",
-                    type="primary",
                 )
 
                 if errors:
@@ -593,8 +727,8 @@ with tab_direct:
     st.subheader("Test a direct readings CSV URL")
 
     st.write(
-        "Use this with your sample URL to validate CSV parsing and Excel "
-        "generation before automating all sensor pages."
+        "Use this with a sample URL to validate CSV parsing, the "
+        "serial/model detection and Excel generation."
     )
 
     csv_url = st.text_input(
@@ -612,35 +746,40 @@ with tab_direct:
 
             with sync_playwright() as p:
                 browser, context, page = create_authenticated_page(p)
-
                 content = download_csv_with_context(context, csv_url)
                 df = parse_csv(content)
-
                 browser.close()
 
-            st.success(
-                f"CSV loaded successfully: {len(df)} rows, "
-                f"{len(df.columns)} columns."
+            filename = Path(urlparse(csv_url).path).name
+            meta = parse_report_filename(filename)
+            sensor_id = re.search(r"/reading/(\d+)/", csv_url)
+            sensor_id = (
+                sensor_id.group(1) if sensor_id else meta["Serial_Number"]
             )
+
+            enriched = enrich_frame(
+                df, f"Sensor_{sensor_id}", sensor_id, filename
+            )
+
+            st.success(
+                f"CSV loaded: {len(df)} rows, {len(df.columns)} columns."
+            )
+
+            st.write("Detected from filename")
+            st.json(meta)
 
             st.write("Detected columns")
-            st.code(", ".join(map(str, df.columns)))
+            st.code(", ".join(map(str, enriched.columns)))
 
-            st.dataframe(df.head(20), use_container_width=True)
+            st.dataframe(enriched.head(20), use_container_width=True)
 
-            excel_bytes = make_excel(
-                "Sensor_177340",
-                [(Path(urlparse(csv_url).path).name, df)],
-            )
+            excel_bytes = make_excel({"All_Readings": sort_by_time(enriched)})
 
             st.download_button(
                 "Download test Excel",
                 data=excel_bytes,
-                file_name="Sensor_177340.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
+                file_name=f"Sensor_{sensor_id}.xlsx",
+                mime=XLSX_MIME,
             )
 
         except Exception as exc:
