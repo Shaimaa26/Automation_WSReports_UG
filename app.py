@@ -3,6 +3,7 @@ import re
 import json
 import time
 import zipfile
+from collections import Counter
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -13,9 +14,6 @@ import streamlit as st
 
 st.set_page_config(page_title="Worldsensing Automation", page_icon="📡", layout="wide")
 
-# --------------------------------------------------
-# Dependency check (clear message instead of a crash)
-# --------------------------------------------------
 for _module, _package in (("requests", "requests"), ("openpyxl", "openpyxl")):
     try:
         __import__(_module)
@@ -41,7 +39,6 @@ class AuthError(Exception):
 
 
 def secret(key, default=""):
-    """Optional Streamlit secret (never printed)."""
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -49,7 +46,7 @@ def secret(key, default=""):
 
 
 # --------------------------------------------------
-# Small HTML parser (links + forms) - no extra packages
+# HTML parsers (links, forms, tables) - no extra packages
 # --------------------------------------------------
 class PageParser(HTMLParser):
     def __init__(self):
@@ -89,6 +86,42 @@ class PageParser(HTMLParser):
             self._a["text"] += data
 
 
+class TableParser(HTMLParser):
+    """Collects every table row as a list of cells (text + links)."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self._row = None
+        self._cell = None
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag == "tr":
+            self._row = []
+            self.rows.append(self._row)
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = {"text": "", "links": []}
+            self._row.append(self._cell)
+        elif tag == "a" and self._cell is not None and a.get("href"):
+            self._cell["links"].append(a["href"])
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in ("td", "th"):
+            self._cell = None
+        elif tag == "tr":
+            self._row = None
+
+    def handle_data(self, data):
+        if self._cell is not None and not self._skip:
+            self._cell["text"] += data
+
+
 def parse_page(html):
     parser = PageParser()
     try:
@@ -96,6 +129,19 @@ def parse_page(html):
     except Exception:
         pass
     return parser
+
+
+def parse_tables(html):
+    parser = TableParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    return parser.rows
+
+
+def clean_text(text):
+    return " ".join(str(text).split())
 
 
 def find_login_form(page):
@@ -107,7 +153,6 @@ def find_login_form(page):
 
 def build_login_payload(form, username, password):
     inputs = [i for i in form["inputs"] if i["name"]]
-
     pass_field = next((i["name"] for i in inputs if i["type"] == "password"), None)
     candidates = [i for i in inputs if i["type"] in ("text", "email")]
     user_field = next(
@@ -115,7 +160,6 @@ def build_login_payload(form, username, password):
          if re.search(r"user|email|login|name", c["name"], re.I)),
         candidates[0]["name"] if candidates else None,
     )
-
     if not pass_field or not user_field:
         raise AuthError(
             "Login form found, but username/password fields could not be "
@@ -135,7 +179,7 @@ def build_login_payload(form, username, password):
                 payload[i["name"]] = i["value"]
                 submit_added = True
             continue
-        payload[i["name"]] = i["value"]  # hidden fields (CSRF tokens, etc.)
+        payload[i["name"]] = i["value"]
 
     payload[user_field] = username
     payload[pass_field] = password
@@ -152,7 +196,6 @@ def connect(site_url, login_url, username, password):
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Worldsensing Collector)"})
     log = []
-
     start = login_url.strip() or site_url.strip()
 
     try:
@@ -197,8 +240,8 @@ def connect(site_url, login_url, username, password):
                 )
             log.append("Login form submitted successfully.")
         else:
-            page_has_no_inputs = not parse_page(r.text).forms
-            if page_has_no_inputs and not session.auth and "login" in r.url.lower():
+            no_forms = not parse_page(r.text).forms
+            if no_forms and not session.auth and "login" in r.url.lower():
                 raise AuthError(
                     "The login page seems to be built with JavaScript, so this "
                     "simple version cannot fill it in."
@@ -229,13 +272,81 @@ def ensure_session(site_url, login_url, username, password):
 
 
 # --------------------------------------------------
-# Sensor discovery
+# Sensor discovery (Nodes table: Id | Name | Model | Status)
 # --------------------------------------------------
-def clean_text(text):
-    return " ".join(str(text).split())
+def find_col(lowered, key):
+    for i, t in enumerate(lowered):
+        if t == key or t.startswith(key + " "):
+            return i
+    return None
 
 
-def discover_sensors(base_url, html, link_filter):
+def default_node_url(base_url, sid):
+    m = re.match(r"(.*?/dataserver/)", base_url)
+    prefix = m.group(1) if m else base_url.rstrip("/") + "/"
+    return f"{prefix}node/view/{sid}"
+
+
+def discover_nodes(base_url, html):
+    """Read the Nodes table. Returns (nodes, expected_total_or_None)."""
+    rows = parse_tables(html)
+    header = None
+    nodes = {}
+
+    for row in rows:
+        texts = [clean_text(c["text"]) for c in row]
+        lowered = [t.lower() for t in texts]
+
+        if header is None:
+            i_id = find_col(lowered, "id")
+            i_model = find_col(lowered, "model")
+            if i_id is not None and i_model is not None:
+                header = {
+                    "id": i_id,
+                    "model": i_model,
+                    "name": find_col(lowered, "name"),
+                    "status": find_col(lowered, "status"),
+                }
+            continue
+
+        if len(texts) <= max(header["id"], header["model"]):
+            continue
+
+        sid = texts[header["id"]]
+        if not re.fullmatch(r"\d+", sid):
+            continue
+
+        links = row[header["id"]]["links"]
+        url = (
+            urljoin(base_url, links[0]) if links
+            else default_node_url(base_url, sid)
+        )
+
+        name = ""
+        if header["name"] is not None and header["name"] < len(texts):
+            name = texts[header["name"]]
+        status = ""
+        if header["status"] is not None and header["status"] < len(texts):
+            status = texts[header["status"]]
+
+        nodes[url] = {
+            "Sensor_Name": name or f"Sensor_{sid}",
+            "Sensor_ID": sid,
+            "Model": texts[header["model"]],
+            "Status": status,
+            "Sensor_URL": url,
+        }
+
+    expected = None
+    m = re.search(r"selected of\s+(\d+)", clean_text(re.sub(r"<[^>]+>", " ", html)))
+    if m:
+        expected = int(m.group(1))
+
+    return list(nodes.values()), expected
+
+
+def discover_by_links(base_url, html, link_filter):
+    """Fallback when no Nodes table is found."""
     page = parse_page(html)
     found = {}
     for link in page.links:
@@ -246,13 +357,15 @@ def discover_sensors(base_url, html, link_filter):
         if link_filter and link_filter.lower() not in full.lower():
             continue
         m = re.search(r"(\d+)/?$", urlparse(full).path)
-        sensor_id = m.group(1) if m else ""
+        sid = m.group(1) if m else ""
         label = clean_text(link["text"])
         if not label or label.lower().startswith("http"):
-            label = f"Sensor_{sensor_id}" if sensor_id else "Sensor"
+            label = f"Sensor_{sid}" if sid else "Sensor"
         found[full] = {
             "Sensor_Name": label,
-            "Sensor_ID": sensor_id,
+            "Sensor_ID": sid,
+            "Model": "",
+            "Status": "",
             "Sensor_URL": full,
         }
     return list(found.values())
@@ -268,6 +381,8 @@ def manual_sensors(text):
             sensors.append({
                 "Sensor_Name": f"Sensor_{sid}" if sid else "Sensor",
                 "Sensor_ID": sid,
+                "Model": "",
+                "Status": "",
                 "Sensor_URL": url,
             })
     return sensors
@@ -333,8 +448,6 @@ def parse_csv(content):
 # --------------------------------------------------
 # Sensor identification + Excel
 # --------------------------------------------------
-# 177340-LSG7ACLBXLHVIB-1-readings-VIBPPV-current.csv
-#   177340 = serial | LSG7ACLBXLHVIB = model | 1 = channel | VIBPPV = type
 FILENAME_PATTERN = re.compile(
     r"^(?P<serial>\d+)-(?P<model>[A-Za-z0-9]+)-(?P<channel>\d+)"
     r"-readings-(?P<rtype>[A-Za-z0-9]+)-(?P<period>[A-Za-z0-9]+)",
@@ -364,7 +477,8 @@ def parse_filename(filename, fallback_serial=""):
     }
 
 
-def enrich_frame(df, sensor_name, sensor_id, filename):
+def enrich_frame(df, sensor_name, sensor_id, filename, model=""):
+    """Add identification columns. Model from the Nodes table wins."""
     meta = parse_filename(filename, fallback_serial=sensor_id)
     out = df.copy()
     out.columns = [str(c) for c in out.columns]
@@ -372,8 +486,8 @@ def enrich_frame(df, sensor_name, sensor_id, filename):
     columns = {
         "Sensor_Name": sensor_name,
         "Sensor_ID": sensor_id,
-        "Serial_Number": meta["Serial_Number"],
-        "Model": meta["Model"],
+        "Serial_Number": meta["Serial_Number"] or sensor_id,
+        "Model": model or meta["Model"],
         "Channel": meta["Channel"],
         "Reading_Type": meta["Reading_Type"],
         "Source_Report": filename,
@@ -473,8 +587,9 @@ def run_collection(session, sensors, delay):
     status = st.empty()
 
     for i, sensor in enumerate(sensors):
-        name, sid, url = sensor["Sensor_Name"], sensor["Sensor_ID"], sensor["Sensor_URL"]
-        status.write(f"Sensor {i + 1}/{len(sensors)}: **{name}**")
+        name, sid = sensor["Sensor_Name"], sensor["Sensor_ID"]
+        url, model = sensor["Sensor_URL"], sensor.get("Model", "")
+        status.write(f"Sensor {i + 1}/{len(sensors)}: **{name}** (serial {sid})")
 
         try:
             r = session.get(url, timeout=TIMEOUT)
@@ -485,9 +600,7 @@ def run_collection(session, sensors, delay):
 
             links = get_csv_links(r.url, r.text)
             if not links:
-                raise RuntimeError(
-                    "No CSV links found on this sensor page (check Diagnostics)."
-                )
+                raise RuntimeError("No CSV links found on this sensor page.")
 
             frames = []
             for csv_url in links:
@@ -498,39 +611,38 @@ def run_collection(session, sensors, delay):
                 try:
                     content = download_csv(session, csv_url)
                     df = parse_csv(content)
-                    enriched = enrich_frame(df, name, sid, filename)
+                    enriched = enrich_frame(df, name, sid, filename, model)
 
                     originals.append((
-                        f"original_reports/{safe_name(name)}__{safe_name(filename)}",
+                        f"original_reports/{sid}__{safe_name(filename)}",
                         content,
                     ))
                     frames.append((filename, enriched))
                     all_frames.append(enriched)
                     downloaded.append({
                         "Sensor": name,
-                        "Sensor ID": sid,
-                        "Serial": enriched["Serial_Number"].iloc[0] if len(enriched) else "",
-                        "Model": enriched["Model"].iloc[0] if len(enriched) else "",
+                        "Serial": sid,
+                        "Model": enriched["Model"].iloc[0] if len(enriched) else model,
                         "Report": filename,
                         "Rows": len(df),
                         "Columns": len(df.columns),
                     })
                     log.append(f"OK   {name} / {filename}: {len(df)} rows")
                 except AuthError as exc:
-                    errors.append(f"{name} / {filename}: AUTH - {exc}")
+                    errors.append(f"{name} ({sid}) / {filename}: AUTH - {exc}")
                 except ValueError as exc:
-                    errors.append(f"{name} / {filename}: CSV - {exc}")
+                    errors.append(f"{name} ({sid}) / {filename}: CSV - {exc}")
                 except Exception as exc:
-                    errors.append(f"{name} / {filename}: {exc}")
+                    errors.append(f"{name} ({sid}) / {filename}: {exc}")
                 time.sleep(delay)
 
             if frames:
-                workbooks[name] = sensor_workbook(frames)
+                workbooks[f"{sid}_{name}"] = sensor_workbook(frames)
 
         except AuthError as exc:
-            errors.append(f"{name}: AUTH - {exc}")
+            errors.append(f"{name} ({sid}): AUTH - {exc}")
         except Exception as exc:
-            errors.append(f"{name}: {exc}")
+            errors.append(f"{name} ({sid}): {exc}")
 
         progress.progress((i + 1) / len(sensors))
 
@@ -543,8 +655,8 @@ def run_collection(session, sensors, delay):
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
         for path, content in originals:
             z.writestr(path, content)
-        for name, wb in workbooks.items():
-            z.writestr(f"per_sensor_workbooks/{safe_name(name)}.xlsx", wb)
+        for key, wb in workbooks.items():
+            z.writestr(f"per_sensor_workbooks/{safe_name(key)}.xlsx", wb)
         if m_xlsx:
             z.writestr("worldsensing_master.xlsx", m_xlsx)
         if len(m_csv):
@@ -576,13 +688,15 @@ def run_collection(session, sensors, delay):
 # UI
 # --------------------------------------------------
 st.title("📡 Worldsensing Automation Portal")
-st.caption("Connect | Find sensors | Collect CSVs | One Excel file")
+st.caption("Connect | Filter sensors by model | Collect every serial | One Excel file")
 
 with st.sidebar:
     st.header("Connection")
     site_url = st.text_input(
-        "Site link",
+        "Nodes page link",
         value=secret("WS_SITE_URL", "https://loadsensing.wocs3.com/33998/dataserver/"),
+        help="The page that shows the Nodes table (Id, Name, Model, Status). "
+             "Copy it from your browser address bar.",
     )
     username = st.text_input("Username", value=secret("WS_USERNAME", ""))
     password = st.text_input("Password", type="password", value=secret("WS_PASSWORD", ""))
@@ -591,12 +705,12 @@ with st.sidebar:
         login_url = st.text_input(
             "Login page link",
             value=secret("WS_LOGIN_URL", ""),
-            help="Only needed if the site link does not redirect to the login page.",
+            help="Only needed if the Nodes page link does not redirect to login.",
         )
         link_filter = st.text_input(
-            "Sensor link contains",
+            "Fallback: sensor link contains",
             value="/node/view/",
-            help="Sensor links on the page must contain this text.",
+            help="Used only if no Nodes table is found on the page.",
         )
         delay = st.number_input("Pause between downloads (seconds)", 0.0, 10.0, 1.0, 0.5)
 
@@ -608,37 +722,88 @@ tab_sensors, tab_collect, tab_test = st.tabs(
 
 # ---------------- Tab 1 ----------------
 with tab_sensors:
-    st.subheader("Connect and discover sensors")
+    st.subheader("Connect and read the Nodes table")
 
     if st.button("Connect and find sensors", type="primary"):
         st.session_state.pop("session", None)
+        st.session_state.pop("model_pick", None)
+        st.session_state.pop("status_pick", None)
         try:
             with st.spinner("Connecting..."):
                 ensure_session(site_url, login_url, username, password)
-            found = discover_sensors(
-                st.session_state["site_final_url"],
-                st.session_state["site_html"],
-                link_filter,
+
+            nodes, expected = discover_nodes(
+                st.session_state["site_final_url"], st.session_state["site_html"]
             )
-            st.session_state["discovered"] = found
+            if not nodes:
+                nodes = discover_by_links(
+                    st.session_state["site_final_url"],
+                    st.session_state["site_html"],
+                    link_filter,
+                )
+                st.session_state["table_mode"] = False
+            else:
+                st.session_state["table_mode"] = True
+
+            st.session_state["nodes"] = nodes
+            st.session_state["expected_nodes"] = expected
             st.success("Connected.")
-            if not found:
+
+            if not nodes:
                 st.warning(
-                    "Connected, but no sensor links matched. Open 'Page links' "
-                    "below, find a sensor link, and change 'Sensor link contains' "
-                    "in the sidebar (Advanced)."
+                    "Connected, but no sensors were found on this page. Make sure "
+                    "'Nodes page link' is the page that shows the Nodes table, "
+                    "or paste sensor links below."
+                )
+            elif expected and expected != len(nodes):
+                st.warning(
+                    f"The page says {expected} nodes, but {len(nodes)} were read. "
+                    "The table may be paginated or loaded by JavaScript."
                 )
         except AuthError as exc:
             st.error(f"Authentication problem: {exc}")
         except Exception as exc:
             st.error(f"Connection problem: {exc}")
 
+    nodes = st.session_state.get("nodes", [])
+    filtered = list(nodes)
+
+    if nodes:
+        st.write(f"**{len(nodes)}** sensors found on the page.")
+
+        model_counts = Counter(n["Model"] for n in nodes if n["Model"])
+        if model_counts:
+            options = {
+                f"{m} ({c})": m
+                for m, c in sorted(model_counts.items(), key=lambda x: -x[1])
+            }
+            default_label = next(iter(options))
+            picked = st.multiselect(
+                "Filter by model",
+                list(options.keys()),
+                default=[default_label],
+                key="model_pick",
+                help="Only sensors with the selected model(s) will be collected.",
+            )
+            picked_models = {options[p] for p in picked}
+            filtered = [n for n in filtered if n["Model"] in picked_models]
+
+        status_values = sorted({n["Status"] for n in nodes if n["Status"]})
+        if status_values:
+            picked_status = st.multiselect(
+                "Filter by status",
+                status_values,
+                default=status_values,
+                key="status_pick",
+            )
+            filtered = [n for n in filtered if n["Status"] in picked_status]
+
     manual = st.text_area(
-        "Or paste sensor page links (one per line)",
+        "Optional: paste extra sensor page links (one per line)",
         placeholder="https://loadsensing.wocs3.com/33998/dataserver/node/view/177340",
     )
 
-    inventory = list(st.session_state.get("discovered", []))
+    inventory = list(filtered)
     known = {s["Sensor_URL"] for s in inventory}
     for s in manual_sensors(manual):
         if s["Sensor_URL"] not in known:
@@ -646,6 +811,7 @@ with tab_sensors:
     st.session_state["inventory"] = inventory
 
     if inventory:
+        st.success(f"{len(inventory)} sensor(s) selected for collection.")
         inv_df = pd.DataFrame(inventory)
         st.dataframe(inv_df, use_container_width=True, hide_index=True)
         st.download_button(
@@ -656,16 +822,20 @@ with tab_sensors:
         )
 
     if st.session_state.get("site_html"):
-        with st.expander("Page links (diagnostics)"):
+        with st.expander("Diagnostics"):
+            for line in st.session_state.get("connect_log", []):
+                st.caption(line)
+            st.caption(
+                "Mode: "
+                + ("Nodes table" if st.session_state.get("table_mode") else "link scan")
+            )
             page = parse_page(st.session_state["site_html"])
             rows = [
                 {"Text": clean_text(l["text"])[:60],
                  "Link": urljoin(st.session_state["site_final_url"], l["href"])}
-                for l in page.links[:80]
+                for l in page.links[:60]
             ]
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            for line in st.session_state.get("connect_log", []):
-                st.caption(line)
 
 # ---------------- Tab 2 ----------------
 with tab_collect:
@@ -673,19 +843,36 @@ with tab_collect:
 
     inventory = st.session_state.get("inventory", [])
     if not inventory:
-        st.info("First connect and find sensors (tab 1), or paste sensor links there.")
+        st.info("First connect and choose sensors in tab 1.")
     else:
-        labels = {f"{s['Sensor_Name']} ({s['Sensor_ID']})": s for s in inventory}
+        labels = {
+            f"{s['Sensor_ID']} - {s['Sensor_Name']}": s for s in inventory
+        }
         chosen = st.multiselect(
-            "Sensors to collect", list(labels.keys()), default=list(labels.keys())
+            "Sensors to collect (all filtered sensors by default)",
+            list(labels.keys()),
+            default=list(labels.keys()),
         )
 
-        if st.button("Start collection", type="primary", disabled=not chosen):
+        c1, c2 = st.columns(2)
+        with c1:
+            start_at = st.number_input("Start from sensor #", 1, 5000, 1)
+        with c2:
+            max_sensors = st.number_input(
+                "Max sensors in this run (0 = all)", 0, 5000, 5,
+                help="Start small (5) to test, then raise it or run in batches.",
+            )
+
+        selected = [labels[c] for c in chosen][int(start_at) - 1:]
+        if max_sensors:
+            selected = selected[:int(max_sensors)]
+
+        st.write(f"This run will collect **{len(selected)}** sensor(s).")
+
+        if st.button("Start collection", type="primary", disabled=not selected):
             try:
                 session = ensure_session(site_url, login_url, username, password)
-                st.session_state["result"] = run_collection(
-                    session, [labels[c] for c in chosen], delay
-                )
+                st.session_state["result"] = run_collection(session, selected, delay)
             except AuthError as exc:
                 st.error(f"Authentication problem: {exc}")
             except Exception as exc:
@@ -703,8 +890,8 @@ with tab_collect:
             st.dataframe(res["summary"], use_container_width=True, hide_index=True)
             st.dataframe(res["master_df"].head(50), use_container_width=True, hide_index=True)
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
+            d1, d2, d3 = st.columns(3)
+            with d1:
                 if res["master_xlsx"]:
                     st.download_button(
                         "MASTER Excel (all sensors)", res["master_xlsx"],
@@ -713,12 +900,12 @@ with tab_collect:
                     )
                 else:
                     st.warning("Too many rows for Excel - use the CSV.")
-            with c2:
+            with d2:
                 st.download_button(
                     "MASTER CSV", res["master_csv"],
                     file_name="worldsensing_master.csv", mime="text/csv",
                 )
-            with c3:
+            with d3:
                 st.download_button(
                     "Everything (ZIP)", res["zip"],
                     file_name="worldsensing_collection.zip", mime="application/zip",
